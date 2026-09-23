@@ -6,15 +6,26 @@ from googleapiclient.discovery import build
 from concurrent.futures import ThreadPoolExecutor
 import io
 
+# Configuración básica de la página
 st.set_page_config(
     page_title="Portal de Calificaciones",
     page_icon="🎓",
-    layout="centered"
+    layout="centered",
+    initial_sidebar_state="collapsed"
 )
 
+# Estilos CSS: Oculta la barra superior (lápiz, github, share, menús)
 st.markdown("""
     <style>
-    .block-container { padding-top: 2rem; max-width: 650px; }
+    /* Ocultar barra superior de desarrollo, lápiz, menús y pie de página */
+    header {visibility: hidden; height: 0%;}
+    [data-testid="stToolbar"] {visibility: hidden; display: none !important;}
+    #MainMenu {visibility: hidden; display: none !important;}
+    footer {visibility: hidden; display: none !important;}
+    .stDeployButton {display: none !important;}
+    
+    /* Centrado y diseño responsivo */
+    .block-container { padding-top: 1.5rem; max-width: 650px; }
     div[data-testid="stMetricValue"] { font-size: 1.5rem; }
     </style>
 """, unsafe_allow_html=True)
@@ -29,7 +40,7 @@ def obtener_pin_defecto(rut_normalizado):
         return rut_normalizado[-5:-1]
     return rut_normalizado
 
-@st.cache_data(ttl=900)  # Guarda en RAM por 15 minutos
+@st.cache_data(ttl=900)  # Mantiene las evaluaciones en memoria RAM por 15 minutos
 def cargar_datos_desde_drive():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets.readonly",
@@ -41,10 +52,9 @@ def cargar_datos_desde_drive():
 
     folder_id = st.secrets["FOLDER_ID"]
     
-    # 1. Listar recursivamente archivos
+    # 1. Explorar recursivamente las subcarpetas (TEÓRICOS y PRACTICOS)
     def listar_archivos(f_id):
         archivos = []
-        # Buscar tanto Google Sheets como archivos Excel (.xlsx)
         q_files = f"'{f_id}' in parents and trashed=false"
         res_files = drive_service.files().list(q=q_files, fields="files(id, name, mimeType)").execute()
         
@@ -57,13 +67,12 @@ def cargar_datos_desde_drive():
 
     todos_los_archivos = listar_archivos(folder_id)
 
-    # 2. Cargar diccionario de Contraseñas desde el archivo en Drive
+    # 2. Cargar contraseñas del archivo contraseñas_app
     mapa_claves = {}
     archivos_evaluaciones = []
 
     for arch in todos_los_archivos:
         nombre = arch['name'].lower()
-        # Detectar el archivo de contraseñas
         if "contrase" in nombre or "clave" in nombre or "password" in nombre:
             try:
                 if arch.get('mimeType') == 'application/vnd.google-apps.spreadsheet':
@@ -91,13 +100,13 @@ def cargar_datos_desde_drive():
                             p = str(row[col_pass]).strip()
                             if c and p and p != 'nan':
                                 mapa_claves[c] = p
-            except Exception as e:
+            except Exception:
                 pass
         else:
             if "CONSOLIDADO" not in arch['name'].upper() and arch.get('mimeType') == 'application/vnd.google-apps.spreadsheet':
                 archivos_evaluaciones.append(arch)
 
-    # 3. Procesar hojas de evaluaciones en paralelo
+    # 3. Procesar hojas de evaluaciones en paralelo para máxima velocidad
     cols_base = ["n°", "rut", "apellido paterno", "apellido materno", "nombres", "correo", "email"]
 
     def procesar_archivo(arch):
@@ -169,7 +178,7 @@ def cargar_datos_desde_drive():
                 
                 email_alumno = fila[idx_correo].strip().lower() if idx_correo != -1 and len(fila) > idx_correo else ""
                 
-                # ASIGNAR CLAVE DEL ARCHIVO (o 4 dígitos de RUT como respaldo)
+                # Asignar PIN desde el archivo cargado (o 4 dígitos de RUT como respaldo)
                 pin_final = mapa_claves.get(email_alumno, obtener_pin_defecto(rut_norm))
 
                 alumnos[rut_norm] = {
@@ -197,14 +206,14 @@ def cargar_datos_desde_drive():
     return alumnos
 
 # ==========================================
-# INTERFAZ Y SESIÓN
+# INTERFAZ Y SESIÓN DE USUARIO
 # ==========================================
 if "user" not in st.session_state:
     st.session_state.user = None
 
 if not st.session_state.user:
-    st.markdown("<h2 style='text-align: center;'>Portal de Calificaciones</h2>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #64748b;'>Consulta tu registro académico</p>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center; margin-bottom: 0.2rem;'>Portal de Calificaciones</h2>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #64748b; font-size: 0.95rem;'>Consulta tu registro académico</p>", unsafe_allow_html=True)
     
     with st.form("form_login"):
         user_input = st.text_input("RUT o Correo UC", placeholder="Ej: 20428599-3 o alumno@uc.cl")
