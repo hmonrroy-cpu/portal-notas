@@ -3,6 +3,8 @@ import gspread
 import pandas as pd
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from concurrent.futures import ThreadPoolExecutor
+import io
 
 st.set_page_config(
     page_title="Portal de Calificaciones",
@@ -27,7 +29,7 @@ def obtener_pin_defecto(rut_normalizado):
         return rut_normalizado[-5:-1]
     return rut_normalizado
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=900)  # Guarda en RAM por 15 minutos
 def cargar_datos_desde_drive():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets.readonly",
@@ -39,27 +41,67 @@ def cargar_datos_desde_drive():
 
     folder_id = st.secrets["FOLDER_ID"]
     
+    # 1. Listar recursivamente archivos
     def listar_archivos(f_id):
         archivos = []
-        q_files = f"'{f_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-        res_files = drive_service.files().list(q=q_files, fields="files(id, name)").execute()
-        archivos.extend(res_files.get('files', []))
+        # Buscar tanto Google Sheets como archivos Excel (.xlsx)
+        q_files = f"'{f_id}' in parents and trashed=false"
+        res_files = drive_service.files().list(q=q_files, fields="files(id, name, mimeType)").execute()
         
-        q_folders = f"'{f_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-        res_folders = drive_service.files().list(q=q_folders, fields="files(id, name)").execute()
-        for subf in res_folders.get('files', []):
-            archivos.extend(listar_archivos(subf['id']))
+        for f in res_files.get('files', []):
+            if f.get('mimeType') == 'application/vnd.google-apps.folder':
+                archivos.extend(listar_archivos(f['id']))
+            else:
+                archivos.append(f)
         return archivos
 
     todos_los_archivos = listar_archivos(folder_id)
-    alumnos = {}
-    cols_base = ["n°", "rut", "apellido paterno", "apellido materno", "nombres", "correo", "email"]
+
+    # 2. Cargar diccionario de Contraseñas desde el archivo en Drive
+    mapa_claves = {}
+    archivos_evaluaciones = []
 
     for arch in todos_los_archivos:
-        nombre_hoja = arch['name']
-        if "CONSOLIDADO" in nombre_hoja.upper():
-            continue
+        nombre = arch['name'].lower()
+        # Detectar el archivo de contraseñas
+        if "contrase" in nombre or "clave" in nombre or "password" in nombre:
+            try:
+                if arch.get('mimeType') == 'application/vnd.google-apps.spreadsheet':
+                    sh = gc.open_by_key(arch['id']).sheet1
+                    filas = sh.get_all_values()
+                    if len(filas) >= 2:
+                        header = [str(h).strip().lower() for h in filas[0]]
+                        idx_c = next((i for i, h in enumerate(header) if "correo" in h or "email" in h or "mail" in h), 0)
+                        idx_p = next((i for i, h in enumerate(header) if "contrase" in h or "clave" in h or "pin" in h or "pass" in h), 1)
+                        for f in filas[1:]:
+                            if len(f) > max(idx_c, idx_p):
+                                c = str(f[idx_c]).strip().lower()
+                                p = str(f[idx_p]).strip()
+                                if c and p:
+                                    mapa_claves[c] = p
+                elif "spreadsheetml" in arch.get('mimeType', '') or nombre.endswith('.xlsx'):
+                    request = drive_service.files().get_media(fileId=arch['id'])
+                    fh = io.BytesIO(request.execute())
+                    df_p = pd.read_excel(fh)
+                    col_correo = next((c for c in df_p.columns if "correo" in str(c).lower() or "email" in str(c).lower()), None)
+                    col_pass = next((c for c in df_p.columns if "contrase" in str(c).lower() or "clave" in str(c).lower() or "pass" in str(c).lower()), None)
+                    if col_correo and col_pass:
+                        for _, row in df_p.iterrows():
+                            c = str(row[col_correo]).strip().lower()
+                            p = str(row[col_pass]).strip()
+                            if c and p and p != 'nan':
+                                mapa_claves[c] = p
+            except Exception as e:
+                pass
+        else:
+            if "CONSOLIDADO" not in arch['name'].upper() and arch.get('mimeType') == 'application/vnd.google-apps.spreadsheet':
+                archivos_evaluaciones.append(arch)
 
+    # 3. Procesar hojas de evaluaciones en paralelo
+    cols_base = ["n°", "rut", "apellido paterno", "apellido materno", "nombres", "correo", "email"]
+
+    def procesar_archivo(arch):
+        nombre_hoja = arch['name']
         es_practico = "PRACTICO" in nombre_hoja.upper()
         categoria = "Práctico" if es_practico else "Teórico"
         nombre_limpio = (
@@ -73,74 +115,90 @@ def cargar_datos_desde_drive():
             sh = gc.open_by_key(arch['id']).sheet1
             filas = sh.get_all_values()
             if len(filas) < 2:
+                return None
+            return {
+                "nombre_limpio": nombre_limpio,
+                "categoria": categoria,
+                "filas": filas
+            }
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        resultados = list(executor.map(procesar_archivo, archivos_evaluaciones))
+
+    alumnos = {}
+
+    for res in resultados:
+        if not res:
+            continue
+
+        nombre_limpio = res["nombre_limpio"]
+        categoria = res["categoria"]
+        filas = res["filas"]
+        headers = filas[0]
+
+        idx_rut = -1
+        idx_correo = -1
+        idx_nom = -1
+        idx_ap_pat = -1
+        cols_eval = []
+
+        for col_idx, h in enumerate(headers):
+            hl = str(h).strip().lower()
+            if hl == "rut": idx_rut = col_idx
+            elif "correo" in hl or "email" in hl: idx_correo = col_idx
+            elif "nombres" in hl: idx_nom = col_idx
+            elif "apellido paterno" in hl: idx_ap_pat = col_idx
+            elif hl not in cols_base and hl != "":
+                cols_eval.append((col_idx, str(h).strip()))
+
+        for fila in filas[1:]:
+            if idx_rut == -1 or len(fila) <= idx_rut:
+                continue
+            
+            rut_raw = fila[idx_rut]
+            rut_norm = normalizar_rut(rut_raw)
+            if not rut_norm:
                 continue
 
-            headers = filas[0]
-            idx_rut = -1
-            idx_correo = -1
-            idx_nom = -1
-            idx_ap_pat = -1
-            idx_clave = -1
-            cols_eval = []
-
-            for col_idx, h in enumerate(headers):
-                hl = str(h).strip().lower()
-                if hl == "rut": idx_rut = col_idx
-                elif "correo" in hl or "email" in hl: idx_correo = col_idx
-                elif "nombres" in hl: idx_nom = col_idx
-                elif "apellido paterno" in hl: idx_ap_pat = col_idx
-                elif "clave" in hl or "pin" in hl: idx_clave = col_idx
-                elif hl not in cols_base and hl != "":
-                    cols_eval.append((col_idx, str(h).strip()))
-
-            for fila in filas[1:]:
-                if idx_rut == -1 or len(fila) <= idx_rut:
-                    continue
+            if rut_norm not in alumnos:
+                nombre_completo = ""
+                if idx_nom != -1 and idx_ap_pat != -1 and len(fila) > max(idx_nom, idx_ap_pat):
+                    nombre_completo = f"{fila[idx_nom].strip()} {fila[idx_ap_pat].strip()}"
                 
-                rut_raw = fila[idx_rut]
-                rut_norm = normalizar_rut(rut_raw)
-                if not rut_norm:
-                    continue
+                email_alumno = fila[idx_correo].strip().lower() if idx_correo != -1 and len(fila) > idx_correo else ""
+                
+                # ASIGNAR CLAVE DEL ARCHIVO (o 4 dígitos de RUT como respaldo)
+                pin_final = mapa_claves.get(email_alumno, obtener_pin_defecto(rut_norm))
 
-                if rut_norm not in alumnos:
-                    nombre_completo = ""
-                    if idx_nom != -1 and idx_ap_pat != -1 and len(fila) > max(idx_nom, idx_ap_pat):
-                        nombre_completo = f"{fila[idx_nom].strip()} {fila[idx_ap_pat].strip()}"
-                    
-                    email_alumno = fila[idx_correo].strip().lower() if idx_correo != -1 and len(fila) > idx_correo else ""
-                    pin_final = (
-                        fila[idx_clave].strip() 
-                        if idx_clave != -1 and len(fila) > idx_clave and fila[idx_clave] != "" 
-                        else obtener_pin_defecto(rut_norm)
-                    )
+                alumnos[rut_norm] = {
+                    "rut_completo": rut_raw,
+                    "nombre": nombre_completo,
+                    "correo": email_alumno,
+                    "pin": pin_final,
+                    "notas": []
+                }
 
-                    alumnos[rut_norm] = {
-                        "rut_completo": rut_raw,
-                        "nombre": nombre_completo,
-                        "correo": email_alumno,
-                        "pin": pin_final,
-                        "notas": []
-                    }
+            detalles_materia = []
+            for c_idx, c_name in cols_eval:
+                if c_idx < len(fila):
+                    val = str(fila[c_idx]).strip().replace(",", ".")
+                    if val not in ["", "0", "0.0", "p", "P"]:
+                        detalles_materia.append({"item": c_name, "nota": val})
 
-                detalles_materia = []
-                for c_idx, c_name in cols_eval:
-                    if c_idx < len(fila):
-                        val = str(fila[c_idx]).strip().replace(",", ".")
-                        if val not in ["", "0", "0.0", "p", "P"]:
-                            detalles_materia.append({"item": c_name, "nota": val})
-
-                if detalles_materia:
-                    alumnos[rut_norm]["notas"].append({
-                        "materia": nombre_limpio,
-                        "tipo": categoria,
-                        "detalles": detalles_materia
-                    })
-
-        except Exception:
-            continue
+            if detalles_materia:
+                alumnos[rut_norm]["notas"].append({
+                    "materia": nombre_limpio,
+                    "tipo": categoria,
+                    "detalles": detalles_materia
+                })
 
     return alumnos
 
+# ==========================================
+# INTERFAZ Y SESIÓN
+# ==========================================
 if "user" not in st.session_state:
     st.session_state.user = None
 
@@ -150,14 +208,14 @@ if not st.session_state.user:
     
     with st.form("form_login"):
         user_input = st.text_input("RUT o Correo UC", placeholder="Ej: 20428599-3 o alumno@uc.cl")
-        pin_input = st.text_input("PIN / Clave", type="password", placeholder="••••")
+        pin_input = st.text_input("PIN / Clave asignada", type="password", placeholder="••••••")
         btn_login = st.form_submit_button("Consultar notas", use_container_width=True)
 
         if btn_login:
             if not user_input or not pin_input:
                 st.warning("Por favor completa ambos campos.")
             else:
-                with st.spinner("Cargando notas del curso..."):
+                with st.spinner("Sincronizando registros con Drive..."):
                     db_alumnos = cargar_datos_desde_drive()
                 
                 ingreso_norm = normalizar_rut(user_input)
